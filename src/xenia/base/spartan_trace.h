@@ -269,6 +269,56 @@ inline std::atomic<uint64_t> freeze_ms[size_t(Cause::kCount)] = {};
 inline Snapshot3 worst_freeze;
 inline std::atomic<uint64_t> short_stalls_by_phase[size_t(GpuPhase::kCount)] = {};
 
+// Raises a to v if v is larger.
+inline void AtomicMax(std::atomic<uint64_t>& a, uint64_t v) {
+  uint64_t seen = a.load(std::memory_order_relaxed);
+  while (v > seen && !a.compare_exchange_weak(seen, v, std::memory_order_relaxed)) {
+  }
+}
+
+// Sound making (apu/audio_system.cc, apu/xma_decoder.cc), taken every 10 s by the sound line. The game's sound code
+// is the callback the audio worker runs once per sound frame (5.3 ms) to make the next frame; late: it started more
+// than one sound frame after its due time. XMA is the Xbox 360's compressed sound (voices, music, effects); each
+// stream (an XMA context) is decoded when the game kicks it, on the thread that kicks it, or on the XMA thread with
+// use_dedicated_xma_thread. Running totals; readers take differences.
+constexpr uint64_t kSoundFrameUs = 5333;
+constexpr uint32_t kXmaStreams = 320;  // XmaDecoder::kContextCount
+struct SoundCounters {
+  std::atomic<uint64_t> callbacks{0}, callback_us{0}, callback_max_us{0}, callbacks_long{0};
+  std::atomic<uint64_t> pumps_late{0}, pump_late_max_us{0}, frames_not_sent{0};
+  std::atomic<uint64_t> decodes{0}, decode_us{0}, decode_in_callback_us{0};
+  std::atomic<uint64_t> decode_max{0};  // us << 16 | stream, so the larger time wins
+  std::atomic<uint64_t> streams_seen[(kXmaStreams + 63) / 64] = {};  // a bit per stream decoded
+  std::atomic<int64_t> streams_open{0};
+  std::atomic<uint64_t> streams_open_max{0}, opened{0}, refused{0};
+};
+inline SoundCounters sound;
+// True on a thread while it runs the game's sound code, so decoding it does there is told apart.
+inline thread_local bool in_sound_callback = false;
+inline void SoundDecoded(uint32_t stream, uint64_t us) {
+  sound.decodes.fetch_add(1, std::memory_order_relaxed);
+  sound.decode_us.fetch_add(us, std::memory_order_relaxed);
+  if (in_sound_callback) {
+    sound.decode_in_callback_us.fetch_add(us, std::memory_order_relaxed);
+  }
+  AtomicMax(sound.decode_max, (us << 16) | (stream & 0xFFFF));
+  if (stream < kXmaStreams) {
+    sound.streams_seen[stream / 64].fetch_or(uint64_t(1) << (stream % 64), std::memory_order_relaxed);
+  }
+}
+inline void SoundStreamOpened(bool ok) {
+  if (!ok) {
+    sound.refused.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  sound.opened.fetch_add(1, std::memory_order_relaxed);
+  const int64_t open = sound.streams_open.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (open > 0) {
+    AtomicMax(sound.streams_open_max, uint64_t(open));
+  }
+}
+inline void SoundStreamClosed() { sound.streams_open.fetch_sub(1, std::memory_order_relaxed); }
+
 }  // namespace spartan
 }  // namespace xe
 

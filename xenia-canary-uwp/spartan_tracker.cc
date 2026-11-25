@@ -21,6 +21,7 @@
 #include "xenia/base/platform_win.h"
 
 #include <algorithm>
+#include <bit>
 
 #include <atomic>
 #include <chrono>
@@ -57,6 +58,8 @@
 extern "C" IMAGE_DOS_HEADER __ImageBase;
 
 DECLARE_bool(log_safepoint_pc);
+DECLARE_bool(use_dedicated_xma_thread);
+DECLARE_string(xma_decoder);
 
 namespace spartan {
 namespace {
@@ -185,6 +188,56 @@ std::atomic<uint64_t> g_audio_dry{0}, g_audio_one_left{0};
 std::atomic<uint64_t> g_app_peak{0}, g_app_limit{0}, g_gpu_peak{0}, g_gpu_budget{0};
 // When the last report card for leaving the app was written: background and suspend come together, one card does.
 std::atomic<uint64_t> g_leave_report_us{0};
+// Sound making, the session so far (the 10 s line adds each window).
+struct SoundSession {
+  std::atomic<uint64_t> callbacks{0}, callbacks_long{0}, callback_max_us{0}, pumps_late{0}, pump_late_max_us{0};
+  std::atomic<uint64_t> decodes{0}, decode_us{0}, decode_in_callback_us{0}, decode_max{0}, refused{0};
+};
+SoundSession g_sound;
+
+const char* XmaWhere() {
+  return cvars::use_dedicated_xma_thread ? "on its own thread (use_dedicated_xma_thread on)"
+                                         : "on the thread that asks (use_dedicated_xma_thread off)";
+}
+
+// Every 10 s while the game makes sound: how its sound code and the XMA decoding kept up.
+void SoundLine() {
+  namespace sp = xe::spartan;
+  sp::SoundCounters& c = sp::sound;
+  const uint64_t callbacks = c.callbacks.exchange(0), callback_us = c.callback_us.exchange(0),
+                 callback_max = c.callback_max_us.exchange(0), longs = c.callbacks_long.exchange(0),
+                 late = c.pumps_late.exchange(0), late_max = c.pump_late_max_us.exchange(0),
+                 not_sent = c.frames_not_sent.exchange(0), decodes = c.decodes.exchange(0),
+                 decode_us = c.decode_us.exchange(0), in_callback = c.decode_in_callback_us.exchange(0),
+                 decode_max = c.decode_max.exchange(0), refused = c.refused.exchange(0);
+  int streams = 0;
+  for (auto& bits : c.streams_seen) {
+    streams += int(std::popcount(bits.exchange(0)));
+  }
+  const int64_t open_now = std::max<int64_t>(0, c.streams_open.load());
+  const uint64_t open_max = std::max<uint64_t>(c.streams_open_max.exchange(uint64_t(open_now)), uint64_t(open_now));
+  g_sound.callbacks += callbacks;
+  g_sound.callbacks_long += longs;
+  g_sound.pumps_late += late;
+  g_sound.decodes += decodes;
+  g_sound.decode_us += decode_us;
+  g_sound.decode_in_callback_us += in_callback;
+  g_sound.refused += refused;
+  sp::AtomicMax(g_sound.callback_max_us, callback_max);
+  sp::AtomicMax(g_sound.pump_late_max_us, late_max);
+  sp::AtomicMax(g_sound.decode_max, decode_max);
+  if (!callbacks && !decodes && !refused) {
+    return;
+  }
+  XELOGI(
+      "Spartan sound: in 10 s the game's sound code ran {} times, {:.2f} ms on average, the slowest {:.1f} ms, {} "
+      "longer than one sound frame (5.3 ms); started late {} times (the worst {:.1f} ms after its time); {} frames "
+      "not made (output full); XMA decoding {}: {} decodes of {} streams, {} ms in all, {} ms of it inside the game's "
+      "sound code, the slowest {:.1f} ms (stream {}); streams open {} (the most {} of {}), {} refused (none free)",
+      callbacks, callbacks ? callback_us / 1000.0 / callbacks : 0.0, callback_max / 1000.0, longs, late,
+      late_max / 1000.0, not_sent, XmaWhere(), decodes, streams, decode_us / 1000, in_callback / 1000,
+      (decode_max >> 16) / 1000.0, decode_max & 0xFFFF, open_now, open_max, sp::kXmaStreams, refused);
+}
 
 void WriteReport(const char* when) {
   namespace sp = xe::spartan;
@@ -281,6 +334,15 @@ void WriteReport(const char* when) {
       io.reads, io.read_bytes / 1048576.0, io.read_us / 1e6, io.slow_reads, slowest_read, io.writes,
       io.write_bytes / 1048576.0, io.slow_writes, slowest_write, io.drive_wait_us / 1e6);
 
+  const uint64_t decode_max = g_sound.decode_max.load();
+  XELOGI(
+      "Spartan report: sound making: the game's sound code ran {} times, {} longer than one sound frame, the slowest "
+      "{:.1f} ms, started late {} times (the worst {:.1f} ms); XMA decoding ({}, decoder '{}'): {} decodes, {:.1f} s in "
+      "all, {:.1f} s inside the game's sound code, the slowest {:.1f} ms (stream {}); {} streams refused (none free)",
+      g_sound.callbacks.load(), g_sound.callbacks_long.load(), g_sound.callback_max_us.load() / 1000.0,
+      g_sound.pumps_late.load(), g_sound.pump_late_max_us.load() / 1000.0, XmaWhere(), cvars::xma_decoder,
+      g_sound.decodes.load(), g_sound.decode_us.load() / 1e6, g_sound.decode_in_callback_us.load() / 1e6,
+      (decode_max >> 16) / 1000.0, decode_max & 0xFFFF, g_sound.refused.load());
   XELOGI(
       "Spartan report: sound ran dry {} times (a gap), down to one frame {} times; memory peaks: app {} of {} MB, "
       "Xbox GPU {} of a {} MB budget",
@@ -350,6 +412,7 @@ void Watch(xe::Emulator* emulator, IDXGIAdapter3* adapter) {
       const uint32_t fewest = sp::audio_min_queued.exchange(UINT32_MAX);
       g_audio_dry.fetch_add(dry);
       g_audio_one_left.fetch_add(one_left);
+      SoundLine();
       if (dry || one_left) {
         XELOGW(
             "Spartan audio: in 10 s {} frames to XAudio2; the sound ran dry {} times (a gap), down to one frame {} "
@@ -444,7 +507,8 @@ void StartTrackers(xe::Emulator* emulator) {
   }
   XELOGI(
       "Spartan trackers: on (short stalls from 80 ms, freezes from 1 s with their cause, shader builds, game file "
-      "reads and writes, audio gaps, memory levels, crashes, a report card every 5 minutes) - the Spartan Test "
+      "reads and writes, saves, sound making and XMA decoding, audio gaps, memory levels, crashes, a report card every 5 "
+      "minutes) - the Spartan Test "
       "trackers by PSYCHOsmurf; source {} {}; thread pc = {}",
       XE_BUILD_BRANCH, XE_BUILD_COMMIT_SHORT,
       cvars::log_safepoint_pc ? "the last loop it passed (log_safepoint_pc on)"
