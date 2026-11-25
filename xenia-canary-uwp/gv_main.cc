@@ -2268,6 +2268,48 @@ void GameVaultXeniaApp::EmulatorThread() {
   // RPCS3 Spartan Test: the test app has its own identity, so Game Vault does not start it. Opened with no game link,
   // it starts the game named on the first line of LocalState\spartan_game.txt (written from the Mac with the
   // packaging's tune script). Without that file nothing changes.
+  // RPCS3 Spartan Test: the drives this app sees, their free space and the Xbox 360 games in Games\xbox360 on each,
+  // in LocalState\spartan_drives.txt (the Device Portal cannot look at USB drives). On its own thread, a line written
+  // per drive: a drive that waits on a consent the console never shows holds only this thread, never the start.
+  std::thread([local = std::filesystem::path(xe::to_path(UWP::GetLocalState()))]() {
+    try {
+      std::ofstream out(local / "spartan_drives.txt", std::ios::trunc);
+      for (char letter = 'D'; letter <= 'Z' && out; ++letter) {
+        std::error_code ec;
+        const std::filesystem::path root = std::string(1, letter) + ":\\";
+        auto space = std::filesystem::space(root, ec);
+        if (ec) {
+          ec.clear();
+          space = std::filesystem::space(root / "Games", ec);
+        }
+        if (ec) continue;
+        out << fmt::format("{}: {:.1f} GB free of {:.1f} GB\n", letter, space.available / 1073741824.0,
+                           space.capacity / 1073741824.0)
+            << std::flush;
+        const auto dir = root / "Games" / "xbox360";
+        if (!std::filesystem::is_directory(dir, ec)) continue;
+        out << "  " << xe::path_to_utf8(dir) << "\n";
+        int lines = 0;
+        std::filesystem::recursive_directory_iterator it(
+            dir, std::filesystem::directory_options::skip_permission_denied, ec);
+        for (; !ec && it != std::filesystem::recursive_directory_iterator() && lines < 400; it.increment(ec)) {
+          if (it.depth() >= 1) it.disable_recursion_pending();   // the game files and one level inside folders
+          std::error_code ec2;
+          const bool folder = it->is_directory(ec2);
+          out << std::string(4 + 2 * it.depth(), ' ') << xe::path_to_utf8(it->path().filename());
+          if (folder) {
+            out << "\\\n";
+          } else {
+            const auto bytes = it->file_size(ec2);
+            out << (ec2 ? std::string("\n") : fmt::format("  {:.2f} GB\n", bytes / 1073741824.0));
+          }
+          ++lines;
+        }
+        out << std::flush;
+      }
+    } catch (...) {
+    }
+  }).detach();
   if (cvars::target.empty() && !UWP::HasGamePath()) {
     std::ifstream spartan_file(std::filesystem::path(xe::to_path(UWP::GetLocalState())) / "spartan_game.txt");
     std::string spartan_game;
