@@ -1,0 +1,79 @@
+# Xenia Spartan Test (PSYCHOsmurf / RPCS3 Spartan Test): Game Vault's Xenia with the Spartan trackers, built for the
+# Xbox (UWP, x64, Release) the way build_edge.bat does on a PC. The unsigned .appx is the artifact; it gets its own
+# test identity and signature on the Mac (packaging scripts), so it installs next to Game Vault's Xenia.
+name: Build Xenia Spartan Test
+
+on:
+  push:
+    branches:
+      - 'spartan/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-uwp:
+    name: Build Xbox app (UWP x64 Release)
+    runs-on: windows-2025
+    timeout-minutes: 240
+    env:
+      POWERSHELL_TELEMETRY_OPTOUT: 1
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: false
+
+      - name: Show the toolchain
+        shell: pwsh
+        run: |
+          & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -all -products * -format text -property displayName
+          & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -all -products * -requires Microsoft.VisualStudio.Workload.Universal -property displayName
+          Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\Include" | Select-Object -ExpandProperty Name
+          cmake --version
+          python --version
+
+      - name: Submodules
+        shell: pwsh
+        run: |
+          # All of them except the desktop-only UI libraries the Xbox app does not build (wxWidgets, SDL3 are
+          # configured only for desktop; SDL3 is still added, so it is fetched).
+          $paths = (Select-String -CaseSensitive '(?<=path = ).+' .gitmodules).Matches.Value | Where-Object { $_ -ne 'third_party/wxWidgets' }
+          git submodule update --init --depth=1 -j $env:NUMBER_OF_PROCESSORS $paths
+
+      - name: Meson, ninja and mako for Mesa's spirv_to_dxil
+        run: python -m pip install --upgrade meson ninja mako pyyaml packaging
+
+      - name: Host tool (xenia-shader-cc) for the UWP build
+        shell: cmd
+        run: |
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DXENIA_HOST_TOOLS_ONLY=ON || exit /b 1
+          cmake --build build --config Release --target xenia-shader-cc -- /m /v:m /nologo || exit /b 1
+          dir build\host_tools\Release
+
+      - name: Build the Xbox app
+        shell: cmd
+        run: |
+          for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath`) do set VSDIR=%%i
+          call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
+          cmake --preset uwp -DCMAKE_SYSTEM_VERSION=10.0.26100.0 || exit /b 1
+          cmake --build build\uwp --config Release --target xenia-uwp -- /m /v:m /nologo /p:AppxPackageSigningEnabled=false /p:GenerateAppxPackageOnBuild=true /p:AppxBundle=Never /p:UapAppxPackageBuildMode=SideloadOnly || exit /b 1
+
+      - name: Collect the package
+        shell: pwsh
+        run: |
+          $appx = Get-ChildItem -Recurse build\uwp -Filter *.appx | Where-Object { $_.FullName -notmatch 'Dependencies' } | Select-Object -First 1
+          if (-not $appx) { Get-ChildItem -Recurse build\uwp -Include *.appx,*.msix | Select-Object FullName; throw "no .appx was made" }
+          New-Item -ItemType Directory -Force out | Out-Null
+          Copy-Item $appx.FullName out\xenia-spartan-unsigned.appx
+          Get-ChildItem -Recurse build\uwp -Filter xeniacanary.map | Select-Object -First 1 | ForEach-Object { Copy-Item $_.FullName out\ }
+          Copy-Item build\uwp\version.h out\ -ErrorAction SilentlyContinue
+          "commit $env:GITHUB_SHA`nrun $env:GITHUB_RUN_ID" | Set-Content out\SOURCE.txt
+          Get-ChildItem out | Format-Table Name, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xenia-spartan-unsigned
+          path: out
+          if-no-files-found: error

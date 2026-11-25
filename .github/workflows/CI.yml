@@ -2,6 +2,9 @@ name: CI
 
 on:
   push:
+    # Spartan test branches build only the Xbox app (build-spartan-xenia.yml)
+    branches-ignore:
+      - 'spartan/**'
     paths-ignore:
       - '*.md'
       - 'docs/**'

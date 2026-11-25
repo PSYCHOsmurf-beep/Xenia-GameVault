@@ -2265,6 +2265,22 @@ void GameVaultXeniaApp::EmulatorThread() {
   app_context().CallInUIThread([this]() { new AddOnProgress(imgui_drawer_.get()); });
   // Opened with no game (a new install has to be opened once from Dev Home before Game Vault can see it): nothing is
   // installed now, or the player waits for every game's add-ons on a screen meant to say "open it once".
+  // RPCS3 Spartan Test: the test app has its own identity, so Game Vault does not start it. Opened with no game link,
+  // it starts the game named on the first line of LocalState\spartan_game.txt (written from the Mac with the
+  // packaging's tune script). Without that file nothing changes.
+  if (cvars::target.empty() && !UWP::HasGamePath()) {
+    std::ifstream spartan_file(std::filesystem::path(xe::to_path(UWP::GetLocalState())) / "spartan_game.txt");
+    std::string spartan_game;
+    if (spartan_file && std::getline(spartan_file, spartan_game)) {
+      const auto first = spartan_game.find_first_not_of(" \t\r\n\"");
+      const auto last = spartan_game.find_last_not_of(" \t\r\n\"");
+      spartan_game = first == std::string::npos ? std::string() : spartan_game.substr(first, last - first + 1);
+      if (!spartan_game.empty()) {
+        XELOGI("Spartan: starting {} (spartan_game.txt)", spartan_game);
+        cvars::target = std::filesystem::u8path(spartan_game);
+      }
+    }
+  }
   if (!cvars::target.empty() || UWP::HasGamePath()) {
     GvUseDrivePackages(emulator_.get());
     InstallGameVaultAddOns(emulator_.get());
