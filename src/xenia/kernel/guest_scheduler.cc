@@ -19,6 +19,8 @@
 #include "xenia/base/math.h"
 #include "xenia/base/mutex.h"
 #include "xenia/base/profiling.h"
+#include "xenia/base/spartan_trace.h"
+#include "xenia/base/threading.h"
 #include "xenia/cpu/backend/backend.h"
 #include "xenia/cpu/ppc/ppc_context.h"
 #include "xenia/cpu/processor.h"
@@ -1623,6 +1625,10 @@ void GuestScheduler::RunLoop(int cpu_index) {
   // Adopt this host thread's stack as this CPU's idle fiber.
   cpu.idle_fiber = xe::threading::Fiber::CreateFromThread();
   XELOGI("GuestScheduler: CPU {} dispatch loop started", cpu_index);
+  // Spartan trackers: this CPU's host thread, for its CPU time in the stall lines
+  if (auto* spartan_host = xe::threading::Thread::GetCurrentThread()) {
+    xe::spartan::cpu_thread_handle[cpu_index].store(spartan_host->native_handle(), std::memory_order_relaxed);
+  }
 
   while (!shutting_down_.load()) {
     // Game Vault: the in-game menu holds the game here, between fibers.
@@ -1725,6 +1731,7 @@ void GuestScheduler::RunLoop(int cpu_index) {
     cpu.parked.store(false);
     stats_.idle_wakes.fetch_add(1, std::memory_order_relaxed);
   }
+  xe::spartan::cpu_thread_handle[cpu_index].store(nullptr, std::memory_order_relaxed);
   XELOGI("GuestScheduler: CPU {} dispatch loop exited (shutting_down={})",
          cpu_index, shutting_down_.load());
 }
@@ -1967,6 +1974,7 @@ void GuestScheduler::WatchdogLoop() {
     if (shutting_down_.load()) {
       break;
     }
+    SpartanTick();
     // No-progress detection, outside lock_ (ReportNoProgress takes it).
     // Only meaningful once something has been dispatched, so a title still
     // loading is not reported.

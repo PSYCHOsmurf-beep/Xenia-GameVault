@@ -8,6 +8,7 @@
  */
 
 #include "xenia/base/gv_perf.h"
+#include "xenia/base/spartan_trace.h"
 #include "xenia/gpu/d3d12/pipeline_cache.h"
 
 #include <algorithm>
@@ -4113,6 +4114,7 @@ bool PipelineCache::GvBuildPipelineNow(void* handle) {
     return false;   // already waited for once and still building: skip, don't wait again
   }
   xe::gv_perf::Scope gv_scope(xe::gv_perf::pipeline_now);
+  xe::spartan::GpuPhaseScope spartan_phase(xe::spartan::GpuPhase::kPipeline);
   GvHelpWithStall(pipeline);
   if (cvars::gv_build_now_max_wait_ms > 0) {
     pipeline->gv_waited = true;

@@ -197,7 +197,11 @@ void FileLogSink::WriteLine(const char* line, size_t size) {
   // only log messages ("w> 00001AB0 ..."); blocks like the settings list or the module header stay whole
   bool prefixed = size > 12 && line[1] == '>' && line[2] == ' ';
   // log_lr_at_instruction lines are asked for on purpose: each hit is written (only the size limit applies)
-  if (!prefixed || std::string_view(line, size).find("log_lr_at_instruction: lr") != std::string_view::npos) {
+  // Spartan trackers (RPCS3 Spartan Test): their messages start with "Spartan " and come at most every 10 s by design,
+  // and the numbers in them are the point, so they are not counted as repeats (a 10 s line read the same as the last
+  // one after 200 s). Only the start of the message counts, so a game's own lines naming "Spartan" are filtered as usual.
+  if (!prefixed || std::string_view(line, size).find("log_lr_at_instruction: lr") != std::string_view::npos ||
+      std::string_view(line + 12, size - 12).substr(0, 8) == "Spartan ") {
     if (written_ + size <= limit_) Put(line, size);
     return;
   }
