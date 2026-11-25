@@ -667,6 +667,19 @@ void InitializeLogging(const std::string_view app_name) {
       log_limit = 4_MiB;
     }
   }
+  // An app without the shared folder (a test build under its own publisher) keeps the log in its LocalState, which
+  // the Device Portal can read; the app's install folder, the fallback below, cannot be written to.
+  if (!log_file && cvars::log_file.empty()) {
+    std::string local = UWP::GetLocalState();
+    if (!local.empty()) {
+      auto file_path = std::filesystem::path(xe::to_path(local)) / "Xenia (Xbox 360).log";
+      std::error_code rotate_error;
+      std::filesystem::rename(file_path, std::filesystem::path(file_path).replace_extension(".previous.log"),
+                              rotate_error);
+      log_file = xe::filesystem::OpenFile(file_path, "wt");
+      log_limit = 4_MiB;
+    }
+  }
 #endif
   if (log_file) {
   } else if (cvars::log_file.empty()) {
