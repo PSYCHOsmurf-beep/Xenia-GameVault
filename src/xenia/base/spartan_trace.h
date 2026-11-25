@@ -187,6 +187,18 @@ inline PipelineCounters pipelines;
 // takes its slot over; the old handle stays open (see CurrentThreadQueryHandle), so a reader never sees a closed one.
 constexpr int kBuilderSlots = 16;
 inline std::atomic<void*> builder_thread_handle[kBuilderSlots] = {};
+// The pipeline each builder is building right now: when it started (0 = none), vertex and pixel shader hashes.
+// Written only by that builder.
+inline Snapshot3 builder_current[kBuilderSlots];
+// The slowest pipeline each builder built this session: us, vertex and pixel shader hashes (that builder only).
+inline Snapshot3 builder_slowest[kBuilderSlots];
+// What the GPU thread does about a pipeline a draw needs: 0 nothing, 1 builds it itself, 2 waits for a builder that
+// has it; and that pipeline: when it started, vertex and pixel shader hashes. GPU thread only.
+inline std::atomic<uint8_t> gpu_pipeline_kind{0};
+inline Snapshot3 gpu_pipeline_current;
+// A pipeline that takes this long to build, or that the GPU thread waits this long for, gets a line of its own.
+constexpr uint64_t kSlowPipelineUs = 2'000'000;
+constexpr uint64_t kLongPipelineWaitUs = 1'000'000;
 
 // The game's file reads and writes (kernel/xfile.cc), timed from the request to the data being there. Every request
 // is on a list while it runs, so a freeze report can say which thread waits for which file and for how long.

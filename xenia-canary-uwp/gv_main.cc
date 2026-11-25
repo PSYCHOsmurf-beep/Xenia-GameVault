@@ -2144,6 +2144,7 @@ void GameVaultXeniaApp::EmulatorThread() {
   emulator_->MountStandardDrives();
   // Spartan trackers (PSYCHOsmurf / Spartan Test): start line, crash handler, memory and audio watch
   spartan::StartTrackers(emulator_.get());
+  app_context().CallInUIThread([]() { spartan::WatchAppLeaving(); });
 
   // A relaunch makes a new graphics system: its frames go to the window again.
   // Edge binds controllers to the game's player slots only when a driver

@@ -16,6 +16,10 @@ void StartTrackers(xe::Emulator* emulator);
 // The report card once more, when Xenia closes (before its last log flush). Nothing when no game showed a frame.
 void FinalReport();
 
+// The report card also when the app goes to the background or is suspended (a quit from the Xbox button ends the
+// app without Xenia's own shutdown). Call on the window's thread, after StartTrackers.
+void WatchAppLeaving();
+
 }  // namespace spartan
 
 #endif  // XENIA_UWP_SPARTAN_TRACKER_H_

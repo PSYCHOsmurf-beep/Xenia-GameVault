@@ -10,8 +10,10 @@
 //   file) and the guest thread that ran, to LocalState\spartan_crash.txt and the log (flushed), before Windows ends
 //   the app. The filter that was there before is still called after.
 // - Game files: every 10 s with a read or write of 100 ms or more, the window's reads and writes and the slowest.
-// - Report card: every 5 minutes while a game runs and when Xenia closes, the session in a few lines: freezes by
-//   cause, short stalls, shaders built while playing, game files, sound and memory peaks. Totals since Xenia started.
+// - Report card: every 5 minutes while a game runs, when the app goes to the background or is suspended (the Xbox
+//   button: a quit from there ends the app without Xenia's own shutdown) and when Xenia closes, the session in a few
+//   lines: freezes by cause, short stalls, shaders built while playing (and each builder's slowest), game files,
+//   sound and memory peaks. Totals since Xenia started.
 
 #include "spartan_tracker.h"
 
@@ -25,6 +27,7 @@
 #include <cstdlib>
 #include <exception>
 #include <iterator>
+#include <tuple>
 #include <utility>
 #include <vector>
 #include <string>
@@ -32,6 +35,9 @@
 
 #include <dxgi1_4.h>
 #include <fileapifromapp.h>
+#include <winrt/Windows.ApplicationModel.Core.h>
+#include <winrt/Windows.ApplicationModel.h>
+#include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.System.h>
 
 #include "third_party/fmt/include/fmt/format.h"
@@ -177,6 +183,8 @@ std::atomic<bool> g_started{false};
 std::atomic<uint64_t> g_first_frame_us{0}, g_first_frame{0};
 std::atomic<uint64_t> g_audio_dry{0}, g_audio_one_left{0};
 std::atomic<uint64_t> g_app_peak{0}, g_app_limit{0}, g_gpu_peak{0}, g_gpu_budget{0};
+// When the last report card for leaving the app was written: background and suspend come together, one card does.
+std::atomic<uint64_t> g_leave_report_us{0};
 
 void WriteReport(const char* when) {
   namespace sp = xe::spartan;
@@ -242,6 +250,21 @@ void WriteReport(const char* when) {
       "({:.1f} s between them); {} failed",
       built, translate_us / 1e6, driver_us / 1e6, built ? (translate_us + driver_us) / built / 1000 : 0, slowest,
       c.now_waited.load(), c.now_wait_us.load() / 1e6, c.bg_built.load(), c.bg_us.load() / 1e6, c.failed.load());
+  // Each builder's slowest pipeline, the slowest first (8 at most).
+  std::vector<std::tuple<uint64_t, int, uint64_t, uint64_t>> slow;
+  for (int i = 0; i < sp::kBuilderSlots; ++i) {
+    uint64_t b[3];
+    if (sp::builder_slowest[i].Read(b) && b[0]) slow.emplace_back(b[0], i, b[1], b[2]);
+  }
+  std::sort(slow.begin(), slow.end(), [](const auto& a, const auto& b) { return std::get<0>(a) > std::get<0>(b); });
+  if (!slow.empty()) {
+    std::string text;
+    for (size_t i = 0; i < slow.size() && i < 8; ++i) {
+      text += fmt::format("{}builder {} {} ms (VS {:016X} PS {:016X})", i ? "; " : "", std::get<1>(slow[i]),
+                          std::get<0>(slow[i]) / 1000, std::get<2>(slow[i]), std::get<3>(slow[i]));
+    }
+    XELOGI("Spartan report: each builder's slowest pipeline: {}", text);
+  }
 
   const sp::IoStats io = sp::IoSession();
   std::string slowest_read, slowest_write;
@@ -400,6 +423,19 @@ void Watch(xe::Emulator* emulator, IDXGIAdapter3* adapter) {
   }
 }
 
+// On the window's thread, when the app is sent to the background or suspended. The log is flushed after: the Xbox
+// may end the app next without warning.
+void LeaveReport(const char* when) {
+  const uint64_t now = xe::spartan::NowUs();
+  const uint64_t last = g_leave_report_us.load();
+  if (last && now - last < 30'000'000) {
+    return;
+  }
+  g_leave_report_us.store(now);
+  WriteReport(when);
+  xe::FlushLog();
+}
+
 }  // namespace
 
 void StartTrackers(xe::Emulator* emulator) {
@@ -419,6 +455,22 @@ void StartTrackers(xe::Emulator* emulator) {
     XELOGW("Spartan trackers: the GPU memory budget can't be read (no DXGI adapter), app memory only");
   }
   std::thread(Watch, emulator, adapter).detach();
+}
+
+void WatchAppLeaving() {
+  static std::atomic<bool> watching{false};
+  if (watching.exchange(true)) {
+    return;
+  }
+  using winrt::Windows::ApplicationModel::Core::CoreApplication;
+  try {
+    CoreApplication::EnteredBackground([](auto&&, auto&&) { LeaveReport("the app went to the background"); });
+    CoreApplication::Suspending([](auto&&, auto&&) { LeaveReport("the app is being suspended"); });
+  } catch (const winrt::hresult_error& error) {
+    XELOGW("Spartan trackers: no report card on leaving the app (0x{:08X})", uint32_t(error.code().value));
+  } catch (...) {
+    XELOGW("Spartan trackers: no report card on leaving the app");
+  }
 }
 
 void FinalReport() {

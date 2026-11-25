@@ -428,6 +428,26 @@ void GuestScheduler::SpartanTick() {
     const uint64_t bg_ms = Since(pipes_now.bg_us, pipes_base.bg_us) / 1000;
     const uint64_t builders_ms =
         Since(builders_now, st.reports == 1 ? st.builders_at_frame : st.builders_at_report) / 1000;
+    // Pipelines being built right now (the counters above only count finished ones).
+    uint64_t gpu_on_ms = 0;
+    std::string on_now;
+    uint64_t current[3];
+    const uint8_t gpu_kind = xe::spartan::gpu_pipeline_kind.load(std::memory_order_relaxed);
+    if (gpu_kind && xe::spartan::gpu_pipeline_current.Read(current) && current[0]) {
+      gpu_on_ms = Since(now, current[0]) / 1000;
+      on_now = fmt::format("the GPU thread {} for {} ms so far (VS {:016X} PS {:016X})",
+                           gpu_kind == 1 ? "builds one itself" : "waits for a builder", gpu_on_ms, current[1],
+                           current[2]);
+    }
+    for (int i = 0; i < xe::spartan::kBuilderSlots; ++i) {
+      if (xe::spartan::builder_current[i].Read(current) && current[0] &&
+          Since(now, current[0]) >= xe::spartan::kSlowIoUs) {
+        on_now += fmt::format("{}builder {} on VS {:016X} PS {:016X} for {} ms", on_now.empty() ? "" : "; ", i,
+                              current[1], current[2], Since(now, current[0]) / 1000);
+      }
+    }
+    const uint64_t shader_ms =
+        std::min(window_ms, now_translate_ms + now_driver_ms + now_wait_ms + std::min(gpu_on_ms, window_ms));
 
     // Game file reads and writes still running, the oldest first.
     std::vector<xe::spartan::IoInFlight> io = xe::spartan::IoRunning();
@@ -447,10 +467,10 @@ void GuestScheduler::SpartanTick() {
     }
     Cause cause;
     std::string detail;
-    if (phase == GpuPhase::kPipeline || now_translate_ms + now_driver_ms + now_wait_ms >= window_ms / 2) {
+    if (phase == GpuPhase::kPipeline || shader_ms >= window_ms / 2) {
       cause = Cause::kShaders;
       detail = fmt::format("a draw waits for its pipeline ({} ms of the last {} ms went to building or waiting)",
-                           now_translate_ms + now_driver_ms + now_wait_ms, window_ms);
+                           shader_ms, window_ms);
     } else if (phase == GpuPhase::kAwaitGpu || phase == GpuPhase::kQueryWait) {
       cause = Cause::kXboxGpu;
       detail = xe::spartan::GpuPhaseName(phase);
@@ -508,11 +528,13 @@ void GuestScheduler::SpartanTick() {
         XELOGW("Spartan stall   CPU{}: idle; host CPU {} ms", i, cpu_ms(i));
       }
     }
-    if (now_built || now_waited || bg_built || builders_ms >= 50) {
+    if (now_built || now_waited || bg_built || builders_ms >= 50 || !on_now.empty()) {
       XELOGW(
-          "Spartan stall   shaders: the GPU thread built {} pipelines itself (translation {} ms, Xbox driver {} ms) "
-          "and waited {} ms for {} a builder had; builders built {} ({} ms between them, {} ms of host CPU)",
-          now_built, now_translate_ms, now_driver_ms, now_wait_ms, now_waited, bg_built, bg_ms, builders_ms);
+          "Spartan stall   shaders: finished since the last report: the GPU thread built {} pipelines itself "
+          "(translation {} ms, Xbox driver {} ms) and waited {} ms for {} a builder had; builders built {} ({} ms "
+          "between them, {} ms of host CPU){}{}",
+          now_built, now_translate_ms, now_driver_ms, now_wait_ms, now_waited, bg_built, bg_ms, builders_ms,
+          on_now.empty() ? "" : "; now: ", on_now);
     }
     size_t files = 0;
     for (const auto& running_io : io) {

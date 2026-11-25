@@ -3811,6 +3811,18 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
   return state;
 }
 
+namespace {
+
+// Spartan Test trackers (PSYCHOsmurf / Spartan Test): a pipeline's vertex and pixel shader hashes (0 for none).
+template <typename PipelineT>
+void SpartanShaderHashes(const PipelineT* pipeline, uint64_t& vs, uint64_t& ps) {
+  const auto& description = pipeline->description;
+  vs = description.vertex_shader ? description.vertex_shader->shader().ucode_data_hash() : 0;
+  ps = description.pixel_shader ? description.pixel_shader->shader().ucode_data_hash() : 0;
+}
+
+}  // namespace
+
 void PipelineCache::CreationThread(size_t thread_index) {
   // Spartan Test trackers (PSYCHOsmurf / Spartan Test): this builder's CPU time for the stall and freeze reports.
   if (thread_index < size_t(xe::spartan::kBuilderSlots)) {
@@ -3949,13 +3961,21 @@ void PipelineCache::CreationThread(size_t thread_index) {
       continue;
     }
 
+    // Spartan Test trackers: what this builder is on, for the freeze reports.
     const uint64_t spartan_start = xe::spartan::NowUs();
+    uint64_t spartan_vs = 0, spartan_ps = 0;
+    SpartanShaderHashes(pipeline_to_create, spartan_vs, spartan_ps);
+    const bool spartan_slot = thread_index < size_t(xe::spartan::kBuilderSlots);
+    if (spartan_slot) {
+      xe::spartan::builder_current[thread_index].Write(spartan_start, spartan_vs, spartan_ps);
+    }
     // Translate pending shaders and update root signature.
     EnsurePipelineShadersTranslated(pipeline_to_create, translator,
                                     ucode_disasm_buffer, dxbc_converter,
                                     dxc_utils, dxc_compiler,
                                     /*use_try_claim=*/true,
                                     /*handle_non_placeholder=*/true);
+    const uint64_t spartan_translated = xe::spartan::NowUs();
 
     // Create the D3D12 pipeline state object.
     ID3D12PipelineState* new_state =
@@ -3982,8 +4002,25 @@ void PipelineCache::CreationThread(size_t thread_index) {
     }
     pipeline_to_create->gv_done.store(true, std::memory_order_release);
     xe::gv_perf::pipelines_built.fetch_add(1, std::memory_order_relaxed);
-    xe::spartan::pipelines.bg_built.fetch_add(1, std::memory_order_relaxed);
-    xe::spartan::pipelines.bg_us.fetch_add(xe::spartan::NowUs() - spartan_start, std::memory_order_relaxed);
+    {
+      const uint64_t spartan_end = xe::spartan::NowUs();
+      const uint64_t spartan_us = spartan_end - spartan_start;
+      xe::spartan::pipelines.bg_built.fetch_add(1, std::memory_order_relaxed);
+      xe::spartan::pipelines.bg_us.fetch_add(spartan_us, std::memory_order_relaxed);
+      if (spartan_slot) {
+        xe::spartan::builder_current[thread_index].Write(0, 0, 0);
+        if (spartan_us > xe::spartan::builder_slowest[thread_index].v[0].load(std::memory_order_relaxed)) {
+          xe::spartan::builder_slowest[thread_index].Write(spartan_us, spartan_vs, spartan_ps);
+        }
+      }
+      if (spartan_us >= xe::spartan::kSlowPipelineUs) {
+        XELOGW(
+            "Spartan shaders: builder {} took {} ms for a pipeline (translation {} ms, Xbox driver {} ms): VS "
+            "{:016X} PS {:016X}",
+            thread_index, spartan_us / 1000, (spartan_translated - spartan_start) / 1000,
+            (spartan_end - spartan_translated) / 1000, spartan_vs, spartan_ps);
+      }
+    }
 
     // Pipeline created - the thread is not busy anymore, safe to set the
     // completion event if needed (at the next iteration, or in some other
@@ -4129,11 +4166,18 @@ bool PipelineCache::GvBuildPipelineNow(void* handle) {
     // Spartan Test trackers: the time this draw waits, however it ends.
     struct SpartanWait {
       uint64_t from = xe::spartan::NowUs();
+      explicit SpartanWait(const Pipeline* pipeline) {
+        uint64_t vs = 0, ps = 0;
+        SpartanShaderHashes(pipeline, vs, ps);
+        xe::spartan::gpu_pipeline_current.Write(from, vs, ps);
+        xe::spartan::gpu_pipeline_kind.store(2, std::memory_order_relaxed);
+      }
       ~SpartanWait() {
+        xe::spartan::gpu_pipeline_kind.store(0, std::memory_order_relaxed);
         xe::spartan::pipelines.now_waited.fetch_add(1, std::memory_order_relaxed);
         xe::spartan::pipelines.now_wait_us.fetch_add(xe::spartan::NowUs() - from, std::memory_order_relaxed);
       }
-    } spartan_wait;
+    } spartan_wait(pipeline);
     pipeline->gv_waited = true;
     // Game Vault 1.1.8.483: the Xbox driver takes 0.3-1.5 s for one pipeline, and the game stood still for all of it
     // (MW3: a freeze every few seconds in the first minutes while the stored list was still being built). Now it goes
@@ -4175,8 +4219,13 @@ bool PipelineCache::GvBuildPipelineNow(void* handle) {
     }
     return pipeline->state.load(std::memory_order_acquire) != nullptr;
   }
+  // Spartan Test trackers: which pipeline the GPU thread is on, for the freeze reports.
+  uint64_t spartan_vs = 0, spartan_ps = 0;
+  SpartanShaderHashes(pipeline, spartan_vs, spartan_ps);
   if (!pipeline->gv_claimed.test_and_set()) {
     const uint64_t spartan_start = xe::spartan::NowUs();
+    xe::spartan::gpu_pipeline_current.Write(spartan_start, spartan_vs, spartan_ps);
+    xe::spartan::gpu_pipeline_kind.store(1, std::memory_order_relaxed);
     EnsurePipelineShadersTranslated(pipeline, *shader_translator_,
                                     ucode_disasm_buffer_, dxbc_converter_,
                                     dxc_utils_, dxc_compiler_,
@@ -4196,6 +4245,7 @@ bool PipelineCache::GvBuildPipelineNow(void* handle) {
     // Spartan Test trackers: built on the GPU thread while the game waits. Only the GPU thread gets here.
     {
       const uint64_t spartan_end = xe::spartan::NowUs();
+      xe::spartan::gpu_pipeline_kind.store(0, std::memory_order_relaxed);
       xe::spartan::PipelineCounters& counters = xe::spartan::pipelines;
       counters.now_built.fetch_add(1, std::memory_order_relaxed);
       counters.now_translate_us.fetch_add(spartan_translated - spartan_start, std::memory_order_relaxed);
@@ -4203,19 +4253,32 @@ bool PipelineCache::GvBuildPipelineNow(void* handle) {
       const uint64_t total = spartan_end - spartan_start;
       if (total > counters.now_slowest_us.load(std::memory_order_relaxed)) {
         counters.now_slowest_us.store(total, std::memory_order_relaxed);
-        const auto& description = pipeline->description;
-        counters.now_slowest.Write(
-            total, description.vertex_shader ? description.vertex_shader->shader().ucode_data_hash() : 0,
-            description.pixel_shader ? description.pixel_shader->shader().ucode_data_hash() : 0);
+        counters.now_slowest.Write(total, spartan_vs, spartan_ps);
+      }
+      if (total >= xe::spartan::kSlowPipelineUs) {
+        XELOGW(
+            "Spartan shaders: the GPU thread took {} ms for a pipeline a draw needed (translation {} ms, Xbox "
+            "driver {} ms): VS {:016X} PS {:016X}",
+            total / 1000, (spartan_translated - spartan_start) / 1000, (spartan_end - spartan_translated) / 1000,
+            spartan_vs, spartan_ps);
       }
     }
   } else {
     const uint64_t spartan_start = xe::spartan::NowUs();
+    xe::spartan::gpu_pipeline_current.Write(spartan_start, spartan_vs, spartan_ps);
+    xe::spartan::gpu_pipeline_kind.store(2, std::memory_order_relaxed);
     while (!pipeline->gv_done.load(std::memory_order_acquire)) {
       std::this_thread::yield();
     }
+    const uint64_t spartan_us = xe::spartan::NowUs() - spartan_start;
+    xe::spartan::gpu_pipeline_kind.store(0, std::memory_order_relaxed);
     xe::spartan::pipelines.now_waited.fetch_add(1, std::memory_order_relaxed);
-    xe::spartan::pipelines.now_wait_us.fetch_add(xe::spartan::NowUs() - spartan_start, std::memory_order_relaxed);
+    xe::spartan::pipelines.now_wait_us.fetch_add(spartan_us, std::memory_order_relaxed);
+    if (spartan_us >= xe::spartan::kLongPipelineWaitUs) {
+      XELOGW("Spartan shaders: the GPU thread waited {} ms for a builder to finish a pipeline a draw needed: VS "
+             "{:016X} PS {:016X}",
+             spartan_us / 1000, spartan_vs, spartan_ps);
+    }
   }
   return pipeline->state.load(std::memory_order_acquire) != nullptr;
 }
