@@ -200,8 +200,17 @@ void FileLogSink::WriteLine(const char* line, size_t size) {
   // Spartan trackers (RPCS3 Spartan Test): their messages start with "Spartan " and come at most every 10 s by design,
   // and the numbers in them are the point, so they are not counted as repeats (a 10 s line read the same as the last
   // one after 200 s). Only the start of the message counts, so a game's own lines naming "Spartan" are filtered as usual.
+  // The message starts after "w> ", the frame ("f:0001234 ", once the game shows frames) and the thread id.
+  size_t message = 3;
+  if (prefixed && size > 5 && line[3] == 'f' && line[4] == ':') {
+    const void* space = std::memchr(line + 3, ' ', size - 3);
+    message = space ? size_t(static_cast<const char*>(space) - line) + 1 : size;
+  }
+  message += 9;
+  const bool spartan = prefixed && message < size &&
+                       std::string_view(line + message, size - message).substr(0, 8) == "Spartan ";
   if (!prefixed || std::string_view(line, size).find("log_lr_at_instruction: lr") != std::string_view::npos ||
-      std::string_view(line + 12, size - 12).substr(0, 8) == "Spartan ") {
+      spartan) {
     if (written_ + size <= limit_) Put(line, size);
     return;
   }

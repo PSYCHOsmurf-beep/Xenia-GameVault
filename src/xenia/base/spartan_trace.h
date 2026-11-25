@@ -62,7 +62,7 @@ inline const char* GpuPhaseName(GpuPhase phase) {
 inline std::atomic<uint8_t> gpu_phase{uint8_t(GpuPhase::kNotStarted)};
 // Set on the GPU (command processor) thread, so the phase scopes in shared code only act there.
 inline thread_local bool tls_is_gpu_thread = false;
-// The GPU thread's native handle (HANDLE on Windows), for its CPU time in the stall lines.
+// The GPU thread's handle (HANDLE on Windows, from CurrentThreadQueryHandle), for its CPU time in the stall lines.
 inline std::atomic<void*> gpu_thread_handle{nullptr};
 // Ring buffer positions after the last executed block, and the write pointer the game last set.
 inline std::atomic<uint32_t> gpu_read_ptr{0}, gpu_write_ptr{0};
@@ -89,6 +89,9 @@ class GpuPhaseScope {
   bool active_;
   uint8_t previous_ = 0;
 };
+
+// A handle another thread can read this thread's CPU time with (Windows; nullptr elsewhere). Kept for the app's life.
+void* CurrentThreadQueryHandle();
 
 // The native handle of each emulated CPU's dispatch thread (guest scheduler), published by the thread itself while its
 // loop runs. The sampler only keeps the handle value, never the thread object, which shutdown frees.

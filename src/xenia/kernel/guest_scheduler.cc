@@ -1626,9 +1626,8 @@ void GuestScheduler::RunLoop(int cpu_index) {
   cpu.idle_fiber = xe::threading::Fiber::CreateFromThread();
   XELOGI("GuestScheduler: CPU {} dispatch loop started", cpu_index);
   // Spartan trackers: this CPU's host thread, for its CPU time in the stall lines
-  if (auto* spartan_host = xe::threading::Thread::GetCurrentThread()) {
-    xe::spartan::cpu_thread_handle[cpu_index].store(spartan_host->native_handle(), std::memory_order_relaxed);
-  }
+  xe::spartan::cpu_thread_handle[cpu_index].store(xe::spartan::CurrentThreadQueryHandle(),
+                                                  std::memory_order_relaxed);
 
   while (!shutting_down_.load()) {
     // Game Vault: the in-game menu holds the game here, between fibers.

@@ -353,9 +353,7 @@ void CommandProcessor::WorkerThreadMain() {
 
   // Spartan trackers: this is the GPU thread (phase scopes act only here; its CPU time goes in the stall lines)
   xe::spartan::tls_is_gpu_thread = true;
-  if (auto* host_thread = xe::threading::Thread::GetCurrentThread()) {
-    xe::spartan::gpu_thread_handle.store(host_thread->native_handle(), std::memory_order_relaxed);
-  }
+  xe::spartan::gpu_thread_handle.store(xe::spartan::CurrentThreadQueryHandle(), std::memory_order_relaxed);
   xe::spartan::gpu_phase.store(uint8_t(xe::spartan::GpuPhase::kCommands), std::memory_order_relaxed);
 
   while (worker_running_) {
