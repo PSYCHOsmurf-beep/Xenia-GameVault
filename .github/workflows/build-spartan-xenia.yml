@@ -37,6 +37,7 @@ jobs:
           python --version
           $uwp = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -version "[17.0,18.0)" -products * -requires Microsoft.VisualStudio.Workload.Universal -property installationPath
           if (-not $uwp) { throw "Visual Studio 2022 with the UWP workload is not on this runner" }
+          "XE_VSDIR=$(@($uwp)[0])" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
           # skitz builds against SDK 10.0.26100.0; use it when present, else the newest one installed.
           $sdks = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\Include" -Directory | Where-Object Name -like '10.0.*' | Select-Object -ExpandProperty Name | Sort-Object { [version]$_ }
           $sdk = if ($sdks -contains '10.0.26100.0') { '10.0.26100.0' } else { $sdks[-1] }
@@ -64,8 +65,7 @@ jobs:
       - name: Build the Xbox app
         shell: cmd
         run: |
-          for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -version "[17.0,18.0)" -latest -products * -property installationPath`) do set VSDIR=%%i
-          call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
+          call "%XE_VSDIR%\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
           cmake --preset uwp -DCMAKE_SYSTEM_VERSION=%XE_SDK% || exit /b 1
           cmake --build build\uwp --config Release --target xenia-uwp -- /m /v:m /nologo /p:AppxPackageSigningEnabled=false /p:GenerateAppxPackageOnBuild=true /p:AppxBundle=Never /p:UapAppxPackageBuildMode=SideloadOnly || exit /b 1
 
