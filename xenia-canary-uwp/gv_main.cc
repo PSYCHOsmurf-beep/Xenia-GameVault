@@ -2142,7 +2142,7 @@ void GameVaultXeniaApp::EmulatorThread() {
   // The hard drive's cache partitions and the other standard drives, as
   // Edge's xenia_main.cc does (GTA IV streams the city through cache:).
   emulator_->MountStandardDrives();
-  // Spartan trackers (RPCS3 Spartan Test, PSYCHOsmurf): start line, crash handler, memory and audio watch
+  // Spartan trackers (PSYCHOsmurf / Spartan Test): start line, crash handler, memory and audio watch
   spartan::StartTrackers(emulator_.get());
 
   // A relaunch makes a new graphics system: its frames go to the window again.
@@ -2265,7 +2265,7 @@ void GameVaultXeniaApp::EmulatorThread() {
   app_context().CallInUIThread([this]() { new AddOnProgress(imgui_drawer_.get()); });
   // Opened with no game (a new install has to be opened once from Dev Home before Game Vault can see it): nothing is
   // installed now, or the player waits for every game's add-ons on a screen meant to say "open it once".
-  // RPCS3 Spartan Test: the test app has its own identity, so Game Vault does not start it. Opened with no game link,
+  // Spartan Test (PSYCHOsmurf): the test app has its own identity, so Game Vault does not start it. Opened with no game link,
   // it starts the game named on the first line of LocalState\spartan_game.txt (written from the Mac with the
   // packaging's tune script). Without that file nothing changes.
   if (cvars::target.empty() && !UWP::HasGamePath()) {
@@ -2527,6 +2527,7 @@ void GameVaultXeniaApp::OnDestroy() {
   UWP::SetHostGuideAction({});
   UWP::RegisterInputSystem(nullptr);
   config::SaveConfig();
+  spartan::FinalReport();
   XELOGI("Game Vault: Xenia closing");
   xe::FlushLog();
   // Like Edge and Canary: no orderly teardown of a running title.

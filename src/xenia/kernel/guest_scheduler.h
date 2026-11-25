@@ -340,7 +340,7 @@ class GuestScheduler {
   uint32_t no_progress_ticks_ = 0;
   bool no_progress_reported_ = false;
   void ReportNoProgress();
-  // Spartan trackers (RPCS3 Spartan Test, PSYCHOsmurf): short-stall sampler and freeze reports, run by the
+  // Spartan trackers (PSYCHOsmurf / Spartan Test): short-stall sampler and freeze reports, run by the
   // watchdog every tick outside lock_ (guest_scheduler_spartan.cc).
   void SpartanTick();
 

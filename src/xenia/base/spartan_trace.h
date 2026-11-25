@@ -1,18 +1,21 @@
-// RPCS3 Spartan Test trackers, ported to Xenia (PSYCHOsmurf / RPCS3 Spartan Test).
+// Spartan Test trackers for Xenia (PSYCHOsmurf / Spartan Test).
 // Released under the BSD license, like Xenia - see LICENSE in the root.
 //
-// What the GPU thread is doing right now and the sound output's health, read by the short-stall sampler and the
-// freeze report (kernel/guest_scheduler_spartan.cc) and the 10 s audio line (xenia-canary-uwp/spartan_tracker.cc).
+// What the GPU thread is doing right now, the shader builders, the game's file reads and writes, and the sound
+// output's health, read by the short-stall sampler and the freeze report (kernel/guest_scheduler_spartan.cc) and the
+// app-side lines and report card (xenia-canary-uwp/spartan_tracker.cc).
 // Plain relaxed atomics: a stale value only makes one sample a little off. Cheap enough for player builds.
 #ifndef XENIA_BASE_SPARTAN_TRACE_H_
 #define XENIA_BASE_SPARTAN_TRACE_H_
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <mutex>
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <vector>
 
 namespace xe {
 namespace spartan {
@@ -131,6 +134,128 @@ inline std::atomic<bool> flush_log_requested{false};
 // its queue empty (the sound had already run dry: an audible gap) or down to one frame, and the fewest frames queued.
 inline std::atomic<uint64_t> audio_frames{0}, audio_dry{0}, audio_one_left{0};
 inline std::atomic<uint32_t> audio_min_queued{UINT32_MAX}, audio_queue_size{0};
+
+// Microseconds of the steady clock, the one time base of all the trackers.
+inline uint64_t NowUs() {
+  return uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                      std::chrono::steady_clock::now().time_since_epoch())
+                      .count());
+}
+
+// Three values that belong together, written by one thread and read by others without a lock (a sequence lock): a
+// reader that meets a write in progress tries again, and after 8 tries gives up (Read returns false).
+struct Snapshot3 {
+  std::atomic<uint32_t> seq{0};
+  std::atomic<uint64_t> v[3] = {};
+  void Write(uint64_t a, uint64_t b, uint64_t c) {
+    const uint32_t s = seq.load(std::memory_order_relaxed);
+    seq.store(s + 1, std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_release);
+    v[0].store(a, std::memory_order_relaxed);
+    v[1].store(b, std::memory_order_relaxed);
+    v[2].store(c, std::memory_order_relaxed);
+    seq.store(s + 2, std::memory_order_release);
+  }
+  bool Read(uint64_t out[3]) const {
+    for (int tries = 0; tries < 8; ++tries) {
+      const uint32_t s = seq.load(std::memory_order_acquire);
+      if (s & 1) continue;
+      out[0] = v[0].load(std::memory_order_relaxed);
+      out[1] = v[1].load(std::memory_order_relaxed);
+      out[2] = v[2].load(std::memory_order_relaxed);
+      std::atomic_thread_fence(std::memory_order_acquire);
+      if (seq.load(std::memory_order_relaxed) == s) return true;
+    }
+    return false;
+  }
+};
+
+// Shader builds (gpu/d3d12/pipeline_cache.cc). "Now": a draw on the GPU thread found its pipeline missing and the
+// GPU thread built it itself (translation = the Xbox 360 shaders made into PC shaders, driver = the Xbox's graphics
+// driver making the pipeline from them), or waited while a builder thread finished it. Builders: the background
+// "D3D12 Pipelines" threads (stored pipelines, look-ahead, queued ones). Running totals; readers take differences.
+struct PipelineCounters {
+  std::atomic<uint64_t> now_built{0}, now_translate_us{0}, now_driver_us{0};
+  std::atomic<uint64_t> now_waited{0}, now_wait_us{0};
+  std::atomic<uint64_t> bg_built{0}, bg_us{0}, failed{0};
+  // The slowest the GPU thread built itself this session: total us, vertex and pixel shader hashes (GPU thread only).
+  std::atomic<uint64_t> now_slowest_us{0};
+  Snapshot3 now_slowest;
+};
+inline PipelineCounters pipelines;
+// The builder threads' handles (CurrentThreadQueryHandle), by builder index, for their CPU time. A restarted builder
+// takes its slot over; the old handle stays open (see CurrentThreadQueryHandle), so a reader never sees a closed one.
+constexpr int kBuilderSlots = 16;
+inline std::atomic<void*> builder_thread_handle[kBuilderSlots] = {};
+
+// The game's file reads and writes (kernel/xfile.cc), timed from the request to the data being there. Every request
+// is on a list while it runs, so a freeze report can say which thread waits for which file and for how long.
+struct IoInFlight {
+  uint32_t thread_id = 0;  // guest thread, 0 off a guest thread (an async completion)
+  bool write = false;
+  uint64_t start_us = 0, offset = 0, bytes = 0;
+  const char* medium = "";
+  std::string file;
+};
+struct IoStats {
+  uint64_t reads = 0, read_bytes = 0, read_us = 0, slow_reads = 0;  // slow: 100 ms or more
+  uint64_t writes = 0, write_bytes = 0, write_us = 0, slow_writes = 0;
+  uint64_t drive_wait_us = 0;  // the emulated drive speed (when on), after the data was read
+  uint64_t slowest_read_us = 0, slowest_read_bytes = 0, slowest_write_us = 0;
+  const char* slowest_read_medium = "";
+  std::string slowest_read_file, slowest_write_file;
+};
+constexpr uint64_t kSlowIoUs = 100'000;
+// Begin puts a request on the list and returns its ticket for End (0 when the list is full: it is still counted).
+// Both take a leaf lock for a few copies only, never while the I/O runs. io_done_us: the data was there; end_us: the
+// emulated drive time (when on) was waited out too.
+uint32_t IoBegin(uint32_t thread_id, bool write, std::string_view file, const char* medium, uint64_t offset,
+                 uint64_t bytes, uint64_t start_us);
+void IoEnd(uint32_t ticket, bool write, std::string_view file, const char* medium, uint64_t done_bytes,
+           uint64_t start_us, uint64_t io_done_us, uint64_t end_us);
+std::vector<IoInFlight> IoRunning();
+// Totals since the last call (window) and since the start (session).
+IoStats IoTakeWindow();
+IoStats IoSession();
+
+// Why a freeze happened, decided at each report of it (guest_scheduler_spartan.cc).
+enum class Cause : uint8_t {
+  kShaders = 0,  // the GPU thread builds or waits for a pipeline a draw needs
+  kXboxGpu,      // waiting for the Xbox GPU (earlier work, an occlusion query)
+  kGpuWork,      // the GPU thread busy with its own work (textures, uploads, commands)
+  kFileRead,     // a game thread waits for a file read (the disc image, local or network)
+  kFileWrite,    // a game thread waits for a file write (saving)
+  kGameBusy,     // a game thread busy on an emulated CPU (computing, or spinning while it waits)
+  kGameWaiting,  // the game's threads all wait (timers, events, sleep) and nothing above is going on
+  kCount,
+};
+inline const char* CauseName(Cause cause) {
+  switch (cause) {
+    case Cause::kShaders:
+      return "shaders being built";
+    case Cause::kXboxGpu:
+      return "waiting for the Xbox GPU";
+    case Cause::kGpuWork:
+      return "the GPU thread's own work";
+    case Cause::kFileRead:
+      return "a file read";
+    case Cause::kFileWrite:
+      return "a file write (saving)";
+    case Cause::kGameBusy:
+      return "a game thread busy on an emulated CPU";
+    case Cause::kGameWaiting:
+      return "the game waiting on itself";
+    default:
+      return "?";
+  }
+}
+
+// Session totals for the report card, written by the freeze and short-stall trackers.
+inline std::atomic<uint64_t> freeze_count[size_t(Cause::kCount)] = {};
+inline std::atomic<uint64_t> freeze_ms[size_t(Cause::kCount)] = {};
+// The longest freeze: ms, cause, frame.
+inline Snapshot3 worst_freeze;
+inline std::atomic<uint64_t> short_stalls_by_phase[size_t(GpuPhase::kCount)] = {};
 
 }  // namespace spartan
 }  // namespace xe

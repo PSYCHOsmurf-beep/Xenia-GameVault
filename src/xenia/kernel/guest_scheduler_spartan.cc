@@ -1,7 +1,7 @@
-// RPCS3 Spartan Test trackers, ported to Xenia (PSYCHOsmurf / RPCS3 Spartan Test).
+// Spartan Test trackers for Xenia (PSYCHOsmurf / Spartan Test).
 // Released under the BSD license, like Xenia - see LICENSE in the root.
 //
-// The same two trackers RPCS3 Spartan Test logs on the Xbox, for Xbox 360 games:
+// The stall and freeze trackers, for Xbox 360 games:
 //
 // Short stalls: a frame held 80 ms or more. Once per stall, 80 ms in, every guest thread is tagged RUN (running on
 // one of the 6 emulated CPUs), Q (ready, but its emulated CPU is busy with another thread), w (blocked, with what it
@@ -14,6 +14,12 @@
 // emulated CPU runs, every blocked and ready thread, the GPU thread's phase and ring buffer, and the CPU time since
 // the report before (spinning or blocked). "frames resumed after" when it ends. The log is flushed (by the trackers'
 // thread, within a second) after each report, so a freeze the player ends by closing the app is still in it.
+//
+// Each report also says what the shader builders did since the one before (pipelines the GPU thread built itself or
+// waited for, the background builders' pipelines and CPU time), which game file reads and writes are still running,
+// and a cause: the first that fits of shaders being built, the Xbox GPU, a file read or write running 0.5 s or more,
+// the GPU thread's own work, a game thread busy on an emulated CPU, or the game waiting on itself. A freeze ends
+// with the cause most of its reports gave, which goes into the session totals of the report card.
 //
 // Guest addresses are logged raw: looking up function names takes the global lock, which a frozen guest thread can
 // hold, and the watchdog must never block (it drives preemption).
@@ -122,12 +128,58 @@ struct State {
   uint64_t cpu_at_frame[kCpuSlots] = {};
   uint64_t cpu_sum[kCpuSlots] = {};
   uint64_t span_sum = 0;
+  // Shader builders: their CPU time and the pipeline counters at the last frame and the last report.
+  uint64_t builders_at_frame = 0, builders_at_report = 0, builders_sum = 0;
+  struct Pipes {
+    uint64_t now_built = 0, now_translate_us = 0, now_driver_us = 0, now_waited = 0, now_wait_us = 0;
+    uint64_t bg_built = 0, bg_us = 0;
+  } pipes_at_frame, pipes_at_report;
+  // This freeze: how many reports gave each cause, and each emulated CPU's pc at the last report.
+  uint32_t cause_reports[size_t(xe::spartan::Cause::kCount)] = {};
+  uint32_t pc_at_report[kCpuSlots] = {};
 };
 // One per watchdog thread: on a relaunch the old scheduler's watchdog can still be stopping while the new one starts.
 thread_local State g_state;
 
 std::string ThreadLabel(const Seen& t) {
   return fmt::format("'{}'{}", t.name.empty() ? fmt::format("tid {:08X}", t.tid) : t.name, t.main ? " (main)" : "");
+}
+
+State::Pipes TakePipes() {
+  const xe::spartan::PipelineCounters& c = xe::spartan::pipelines;
+  State::Pipes p;
+  p.now_built = c.now_built.load(std::memory_order_relaxed);
+  p.now_translate_us = c.now_translate_us.load(std::memory_order_relaxed);
+  p.now_driver_us = c.now_driver_us.load(std::memory_order_relaxed);
+  p.now_waited = c.now_waited.load(std::memory_order_relaxed);
+  p.now_wait_us = c.now_wait_us.load(std::memory_order_relaxed);
+  p.bg_built = c.bg_built.load(std::memory_order_relaxed);
+  p.bg_us = c.bg_us.load(std::memory_order_relaxed);
+  return p;
+}
+
+// The builders' CPU time together (a restarted builder can make it go back: callers clamp at 0).
+uint64_t BuildersCpuUs() {
+  uint64_t sum = 0;
+  for (int i = 0; i < xe::spartan::kBuilderSlots; ++i) {
+    if (void* handle = xe::spartan::builder_thread_handle[i].load(std::memory_order_relaxed)) {
+      sum += ThreadCpuUs(handle);
+    }
+  }
+  return sum;
+}
+
+uint64_t Since(uint64_t now, uint64_t then) { return now >= then ? now - then : 0; }
+
+std::string IoText(const xe::spartan::IoInFlight& io, uint64_t now) {
+  std::string who = io.thread_id ? xe::spartan::ThreadName(io.thread_id) : std::string();
+  if (who.empty()) {
+    who = io.thread_id ? fmt::format("tid {:08X}", io.thread_id) : "an I/O worker (async)";
+  } else {
+    who = fmt::format("'{}'", who);
+  }
+  return fmt::format("{} '{}' for {} ms so far ({} KB at {:X}, {}), {}", io.write ? "writing" : "reading", io.file,
+                     Since(now, io.start_us) / 1000, (io.bytes + 1023) / 1024, io.offset, io.medium, who);
 }
 
 uint64_t NextReportSecond(uint64_t after) {
@@ -163,7 +215,7 @@ void GuestScheduler::SpartanTick() {
   };
 
   // The 10 s tally of short stalls, the frame-holders first (main thread, running and queued threads, the GPU), then
-  // by count. Every entry is written: RPCS3's capped list cut exactly the ones that mattered.
+  // by count. Every entry is written: a capped list would cut exactly the ones that matter.
   if (now - st.tally_at >= kTallyPeriodUs) {
     if (st.stalls) {
       std::vector<std::tuple<int, uint32_t, std::string>> rows;
@@ -190,16 +242,17 @@ void GuestScheduler::SpartanTick() {
         per_cpu += fmt::format("{}{:.0f}", i ? "/" : "", st.cpu_sum[i] / n / 1000.0);
         busy += st.cpu_sum[i];
       }
-      busy += st.cpu_sum[kGpuSlot];
+      busy += st.cpu_sum[kGpuSlot] + st.builders_sum;
       XELOGW(
           "Spartan short stalls CPU: per stall {:.0f} ms since the last frame: emulated CPUs 0-5 {} ms, GPU thread "
-          "{:.0f} ms ({:.1f} host threads busy)",
-          st.span_sum / n / 1000.0, per_cpu, st.cpu_sum[kGpuSlot] / n / 1000.0,
+          "{:.0f} ms, shader builders {:.0f} ms ({:.1f} host threads busy)",
+          st.span_sum / n / 1000.0, per_cpu, st.cpu_sum[kGpuSlot] / n / 1000.0, st.builders_sum / n / 1000.0,
           st.span_sum ? double(busy) / double(st.span_sum) : 0.0);
     }
     st.tally.clear();
     st.stalls = 0;
     st.span_sum = 0;
+    st.builders_sum = 0;
     std::fill(std::begin(st.cpu_sum), std::end(st.cpu_sum), 0);
     st.tally_at = now;
   }
@@ -212,18 +265,36 @@ void GuestScheduler::SpartanTick() {
     st.sampled = true;
     st.reports = 0;
     st.next_report_s = 1;
+    std::fill(std::begin(st.cause_reports), std::end(st.cause_reports), 0);
     return;
   }
   if (frame != st.frame) {
     if (st.reports) {
-      XELOGW("Spartan stall: frames resumed after {:.2f} s", (now - st.frame_at) / 1e6);
+      // The cause most of its reports gave; on a tie the one listed first in spartan::Cause.
+      size_t cause = 0;
+      for (size_t i = 1; i < size_t(xe::spartan::Cause::kCount); ++i) {
+        if (st.cause_reports[i] > st.cause_reports[cause]) cause = i;
+      }
+      const uint64_t ms = (now - st.frame_at) / 1000;
+      XELOGW("Spartan stall: frames resumed after {:.2f} s (cause: {})", (now - st.frame_at) / 1e6,
+             xe::spartan::CauseName(xe::spartan::Cause(cause)));
+      xe::spartan::freeze_count[cause].fetch_add(1, std::memory_order_relaxed);
+      xe::spartan::freeze_ms[cause].fetch_add(ms, std::memory_order_relaxed);
+      // Written by this watchdog only (a relaunch can overlap two for a moment: then a report card may show one
+      // freeze's time with another's cause, never anything worse).
+      if (ms > xe::spartan::worst_freeze.v[0].load(std::memory_order_relaxed)) {
+        xe::spartan::worst_freeze.Write(ms, cause, st.frame);
+      }
     }
     st.frame = frame;
     st.frame_at = now;
     st.sampled = false;
     st.reports = 0;
     st.next_report_s = 1;
+    std::fill(std::begin(st.cause_reports), std::end(st.cause_reports), 0);
     cpu_times(st.cpu_at_frame);
+    st.builders_at_frame = BuildersCpuUs();
+    st.pipes_at_frame = TakePipes();
     return;
   }
   const uint64_t idle = now - st.frame_at;
@@ -300,6 +371,7 @@ void GuestScheduler::SpartanTick() {
   const auto phase = xe::spartan::GpuPhase(xe::spartan::gpu_phase.load(std::memory_order_relaxed));
   uint64_t cpu_now[kCpuSlots];
   cpu_times(cpu_now);
+  const uint64_t builders_now = BuildersCpuUs();
 
   if (sample) {
     st.sampled = true;
@@ -308,6 +380,9 @@ void GuestScheduler::SpartanTick() {
     for (int i = 0; i < kCpuSlots; ++i) {
       st.cpu_sum[i] += cpu_now[i] >= st.cpu_at_frame[i] ? cpu_now[i] - st.cpu_at_frame[i] : 0;
     }
+    st.builders_sum += Since(builders_now, st.builders_at_frame);
+    xe::spartan::short_stalls_by_phase[std::min(size_t(phase), size_t(xe::spartan::GpuPhase::kCount) - 1)]
+        .fetch_add(1, std::memory_order_relaxed);
     uint32_t running = 0;
     for (bool b : cpu_busy) running += b;
     st.tally[fmt::format("emulated CPUs running {}", running)]++;
@@ -339,7 +414,75 @@ void GuestScheduler::SpartanTick() {
     const uint64_t since = st.reports == 1 ? idle : now - st.report_at;
     const uint64_t* base = st.reports == 1 ? st.cpu_at_frame : st.cpu_at_report;
     const auto cpu_ms = [&](int i) { return cpu_now[i] >= base[i] ? (cpu_now[i] - base[i]) / 1000 : 0; };
+    const uint64_t window_ms = std::max<uint64_t>(since / 1000, 1);
+
+    // Shader builders since the last report (or the last frame).
+    const State::Pipes& pipes_base = st.reports == 1 ? st.pipes_at_frame : st.pipes_at_report;
+    const State::Pipes pipes_now = TakePipes();
+    const uint64_t now_built = Since(pipes_now.now_built, pipes_base.now_built);
+    const uint64_t now_translate_ms = Since(pipes_now.now_translate_us, pipes_base.now_translate_us) / 1000;
+    const uint64_t now_driver_ms = Since(pipes_now.now_driver_us, pipes_base.now_driver_us) / 1000;
+    const uint64_t now_waited = Since(pipes_now.now_waited, pipes_base.now_waited);
+    const uint64_t now_wait_ms = Since(pipes_now.now_wait_us, pipes_base.now_wait_us) / 1000;
+    const uint64_t bg_built = Since(pipes_now.bg_built, pipes_base.bg_built);
+    const uint64_t bg_ms = Since(pipes_now.bg_us, pipes_base.bg_us) / 1000;
+    const uint64_t builders_ms =
+        Since(builders_now, st.reports == 1 ? st.builders_at_frame : st.builders_at_report) / 1000;
+
+    // Game file reads and writes still running, the oldest first.
+    std::vector<xe::spartan::IoInFlight> io = xe::spartan::IoRunning();
+    std::sort(io.begin(), io.end(), [](const auto& a, const auto& b) { return a.start_us < b.start_us; });
+    const uint64_t oldest_io_ms = io.empty() ? 0 : Since(now, io.front().start_us) / 1000;
+
+    // The cause: the first that fits (see the top of this file).
+    using xe::spartan::Cause;
+    using xe::spartan::GpuPhase;
+    int busiest = 0;
+    for (int i = 1; i < kGpuSlot; ++i) {
+      if (cpu_ms(i) > cpu_ms(busiest)) busiest = i;
+    }
+    const Seen* busiest_thread = nullptr;
+    for (const Seen& t : seen) {
+      if (t.tag == 'R' && t.cpu == busiest) busiest_thread = &t;
+    }
+    Cause cause;
+    std::string detail;
+    if (phase == GpuPhase::kPipeline || now_translate_ms + now_driver_ms + now_wait_ms >= window_ms / 2) {
+      cause = Cause::kShaders;
+      detail = fmt::format("a draw waits for its pipeline ({} ms of the last {} ms went to building or waiting)",
+                           now_translate_ms + now_driver_ms + now_wait_ms, window_ms);
+    } else if (phase == GpuPhase::kAwaitGpu || phase == GpuPhase::kQueryWait) {
+      cause = Cause::kXboxGpu;
+      detail = xe::spartan::GpuPhaseName(phase);
+    } else if (oldest_io_ms >= 500) {
+      cause = io.front().write ? Cause::kFileWrite : Cause::kFileRead;
+      detail = IoText(io.front(), now);
+    } else if ((phase == GpuPhase::kCommands || phase == GpuPhase::kTexture || phase == GpuPhase::kUpload ||
+                phase == GpuPhase::kSwap) &&
+               cpu_ms(kGpuSlot) >= window_ms / 2) {
+      cause = Cause::kGpuWork;
+      detail = fmt::format("{}, {} of the last {} ms busy", xe::spartan::GpuPhaseName(phase), cpu_ms(kGpuSlot),
+                           window_ms);
+    } else if (cpu_ms(busiest) >= window_ms / 2) {
+      cause = Cause::kGameBusy;
+      if (busiest_thread) {
+        detail = fmt::format("{} on CPU{} used {} of the last {} ms, at pc {:08X} ({})", ThreadLabel(*busiest_thread),
+                             busiest, cpu_ms(busiest), window_ms, busiest_thread->pc,
+                             st.reports == 1                                   ? "first report"
+                             : busiest_thread->pc == st.pc_at_report[busiest] ? "the same place as the last report"
+                                                                               : "moved since the last report");
+      } else {
+        detail = fmt::format("CPU{} used {} of the last {} ms", busiest, cpu_ms(busiest), window_ms);
+      }
+    } else {
+      cause = Cause::kGameWaiting;
+      detail = fmt::format("no emulated CPU half busy, no file read or write running 0.5 s, GPU thread {}",
+                           xe::spartan::GpuPhaseName(phase));
+    }
+    st.cause_reports[size_t(cause)]++;
+
     XELOGW("Spartan stall: no new frame for {:.0f} s (frame {})", idle / 1e6, frame);
+    XELOGW("Spartan stall   cause: {}: {}", xe::spartan::CauseName(cause), detail);
     std::string gpu = fmt::format("Spartan stall   GPU thread: {}; ring read {:X} write {:X}",
                                   xe::spartan::GpuPhaseName(phase),
                                   xe::spartan::gpu_read_ptr.load(std::memory_order_relaxed),
@@ -365,6 +508,21 @@ void GuestScheduler::SpartanTick() {
         XELOGW("Spartan stall   CPU{}: idle; host CPU {} ms", i, cpu_ms(i));
       }
     }
+    if (now_built || now_waited || bg_built || builders_ms >= 50) {
+      XELOGW(
+          "Spartan stall   shaders: the GPU thread built {} pipelines itself (translation {} ms, Xbox driver {} ms) "
+          "and waited {} ms for {} a builder had; builders built {} ({} ms between them, {} ms of host CPU)",
+          now_built, now_translate_ms, now_driver_ms, now_wait_ms, now_waited, bg_built, bg_ms, builders_ms);
+    }
+    size_t files = 0;
+    for (const auto& running_io : io) {
+      if (Since(now, running_io.start_us) < xe::spartan::kSlowIoUs) break;
+      if (++files > 8) {
+        XELOGW("Spartan stall   ... more file reads and writes running");
+        break;
+      }
+      XELOGW("Spartan stall   file: {}", IoText(running_io, now));
+    }
     // Waiting threads and the ready queues; the main thread first. 48 lines at most.
     std::vector<const Seen*> rest;
     for (const Seen& t : seen) {
@@ -387,6 +545,12 @@ void GuestScheduler::SpartanTick() {
       }
     }
     std::copy(std::begin(cpu_now), std::end(cpu_now), std::begin(st.cpu_at_report));
+    st.builders_at_report = builders_now;
+    st.pipes_at_report = pipes_now;
+    for (int i = 0; i < kCpuSlots; ++i) st.pc_at_report[i] = 0;
+    for (const Seen& t : seen) {
+      if (t.tag == 'R' && t.cpu >= 0 && t.cpu < kCpuSlots) st.pc_at_report[t.cpu] = t.pc;
+    }
     st.report_at = now;
     st.next_report_s = NextReportSecond(idle / 1'000'000);
     xe::spartan::flush_log_requested.store(true, std::memory_order_relaxed);

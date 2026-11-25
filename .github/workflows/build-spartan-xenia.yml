@@ -1,4 +1,4 @@
-# Xenia Spartan Test (PSYCHOsmurf / RPCS3 Spartan Test): Game Vault's Xenia with the Spartan trackers, built for the
+# Xenia Spartan Test (PSYCHOsmurf / Spartan Test): Game Vault's Xenia with the Spartan trackers, built for the
 # Xbox (UWP, x64, Release) the way build_edge.bat does on a PC. The unsigned .appx is the artifact; it gets its own
 # test identity and signature on the Mac (packaging scripts), so it installs next to Game Vault's Xenia.
 name: Build Xenia Spartan Test

@@ -1,4 +1,4 @@
-// RPCS3 Spartan Test trackers, ported to Xenia (PSYCHOsmurf / RPCS3 Spartan Test).
+// Spartan Test trackers for Xenia (PSYCHOsmurf / Spartan Test).
 // Released under the BSD license, like Xenia - see LICENSE in the root.
 //
 // The app-side trackers (the stall and freeze trackers are in kernel/guest_scheduler_spartan.cc):
@@ -9,6 +9,9 @@
 // - Crashes: an exception nothing handled is written with where it happened (xeniacanary.exe+offset, for the /MAP
 //   file) and the guest thread that ran, to LocalState\spartan_crash.txt and the log (flushed), before Windows ends
 //   the app. The filter that was there before is still called after.
+// - Game files: every 10 s with a read or write of 100 ms or more, the window's reads and writes and the slowest.
+// - Report card: every 5 minutes while a game runs and when Xenia closes, the session in a few lines: freezes by
+//   cause, short stalls, shaders built while playing, game files, sound and memory peaks. Totals since Xenia started.
 
 #include "spartan_tracker.h"
 
@@ -23,6 +26,7 @@
 #include <exception>
 #include <iterator>
 #include <utility>
+#include <vector>
 #include <string>
 #include <thread>
 
@@ -168,6 +172,99 @@ void InstallCrashHandlers() {
   g_previous_terminate = std::set_terminate(OnTerminate);
 }
 
+// What only this file sees, for the report card (FinalReport runs on the window's thread).
+std::atomic<bool> g_started{false};
+std::atomic<uint64_t> g_first_frame_us{0}, g_first_frame{0};
+std::atomic<uint64_t> g_audio_dry{0}, g_audio_one_left{0};
+std::atomic<uint64_t> g_app_peak{0}, g_app_limit{0}, g_gpu_peak{0}, g_gpu_budget{0};
+
+void WriteReport(const char* when) {
+  namespace sp = xe::spartan;
+  const uint64_t frame = xe::logging::GetFrameNumber();
+  const uint64_t first_us = g_first_frame_us.load(), first_frame = g_first_frame.load();
+  if (!frame || !first_us) {
+    return;
+  }
+  const double seconds = std::max(1.0, double(sp::NowUs() - first_us) / 1e6);
+  XELOGI("Spartan report ({}): {:.0f} min since the first frame, frame {}, {:.1f} frames a second on average",
+         when, seconds / 60, frame, double(frame > first_frame ? frame - first_frame : 0) / seconds);
+
+  uint64_t freezes = 0, freeze_ms = 0;
+  std::string by_cause;
+  for (size_t i = 0; i < size_t(sp::Cause::kCount); ++i) {
+    const uint64_t n = sp::freeze_count[i].load(std::memory_order_relaxed);
+    const uint64_t ms = sp::freeze_ms[i].load(std::memory_order_relaxed);
+    if (!n) continue;
+    freezes += n;
+    freeze_ms += ms;
+    by_cause += fmt::format("{}{} {} ({:.1f} s)", by_cause.empty() ? "" : ", ", sp::CauseName(sp::Cause(i)), n,
+                            ms / 1000.0);
+  }
+  std::string worst;
+  uint64_t w[3];
+  if (freezes && sp::worst_freeze.Read(w) && w[1] < uint64_t(sp::Cause::kCount)) {
+    worst = fmt::format(", the longest {:.1f} s at frame {} ({})", w[0] / 1000.0, w[2],
+                        sp::CauseName(sp::Cause(w[1])));
+  }
+  XELOGI("Spartan report: freezes (no new frame for 1 s or more): {}, {:.1f} s in all{}", freezes, freeze_ms / 1000.0,
+         worst);
+  if (freezes) {
+    XELOGI("Spartan report:   by cause: {}", by_cause);
+  }
+
+  uint64_t stalls = 0;
+  std::vector<std::pair<uint64_t, size_t>> phases;
+  for (size_t i = 0; i < size_t(sp::GpuPhase::kCount); ++i) {
+    const uint64_t n = sp::short_stalls_by_phase[i].load(std::memory_order_relaxed);
+    if (!n) continue;
+    stalls += n;
+    phases.emplace_back(n, i);
+  }
+  std::sort(phases.begin(), phases.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+  std::string by_phase;
+  for (const auto& [n, i] : phases) {
+    by_phase += fmt::format("{}{} {}", by_phase.empty() ? "" : ", ", sp::GpuPhaseName(sp::GpuPhase(i)), n);
+  }
+  XELOGI("Spartan report: short stalls (a frame held 80 ms or more): {}{}{}", stalls,
+         stalls ? "; the GPU thread was: " : "", by_phase);
+
+  const sp::PipelineCounters& c = sp::pipelines;
+  const uint64_t built = c.now_built.load(), translate_us = c.now_translate_us.load(),
+                 driver_us = c.now_driver_us.load();
+  std::string slowest;
+  uint64_t s3[3];
+  if (built && c.now_slowest.Read(s3)) {
+    slowest = fmt::format("; the slowest {} ms (VS {:016X} PS {:016X})", s3[0] / 1000, s3[1], s3[2]);
+  }
+  XELOGI(
+      "Spartan report: shaders built while playing: the GPU thread built {} itself (translation {:.1f} s, Xbox "
+      "driver {:.1f} s, {} ms each on average{}) and waited {} times for a builder ({:.1f} s); the builders built {} "
+      "({:.1f} s between them); {} failed",
+      built, translate_us / 1e6, driver_us / 1e6, built ? (translate_us + driver_us) / built / 1000 : 0, slowest,
+      c.now_waited.load(), c.now_wait_us.load() / 1e6, c.bg_built.load(), c.bg_us.load() / 1e6, c.failed.load());
+
+  const sp::IoStats io = sp::IoSession();
+  std::string slowest_read, slowest_write;
+  if (io.reads) {
+    slowest_read = fmt::format(", the slowest {} ms: '{}' ({} KB, {})", io.slowest_read_us / 1000,
+                               io.slowest_read_file, (io.slowest_read_bytes + 1023) / 1024, io.slowest_read_medium);
+  }
+  if (io.writes) {
+    slowest_write = fmt::format(", the slowest {} ms: '{}'", io.slowest_write_us / 1000, io.slowest_write_file);
+  }
+  XELOGI(
+      "Spartan report: game files: {} reads ({:.0f} MB, {:.1f} s), {} took 100 ms or more{}; {} writes ({:.1f} MB), "
+      "{} took 100 ms or more{}; emulated drive speed waits {:.1f} s",
+      io.reads, io.read_bytes / 1048576.0, io.read_us / 1e6, io.slow_reads, slowest_read, io.writes,
+      io.write_bytes / 1048576.0, io.slow_writes, slowest_write, io.drive_wait_us / 1e6);
+
+  XELOGI(
+      "Spartan report: sound ran dry {} times (a gap), down to one frame {} times; memory peaks: app {} of {} MB, "
+      "Xbox GPU {} of a {} MB budget",
+      g_audio_dry.load(), g_audio_one_left.load(), g_app_peak.load() >> 20, g_app_limit.load() >> 20,
+      g_gpu_peak.load() >> 20, g_gpu_budget.load() >> 20);
+}
+
 // Warns once per level passed; a level is armed again after use falls 10 points below it.
 struct Levels {
   bool passed[3] = {};
@@ -208,12 +305,18 @@ void Watch(xe::Emulator* emulator, IDXGIAdapter3* adapter) {
   namespace sp = xe::spartan;
   Levels app_levels, gpu_levels;
   uint64_t app_peak = 0, gpu_peak = 0;
-  auto last_audio = steady_clock::now(), last_memory = last_audio;
+  auto last_audio = steady_clock::now(), last_memory = last_audio, last_report = last_audio;
   for (;;) {
     std::this_thread::sleep_for(seconds(1));
     const auto now = steady_clock::now();
     if (sp::flush_log_requested.exchange(false)) {
       xe::FlushLog();
+    }
+    if (!g_first_frame_us.load()) {
+      if (const uint64_t frame = xe::logging::GetFrameNumber()) {
+        g_first_frame.store(frame);
+        g_first_frame_us.store(sp::NowUs());
+      }
     }
 
     // Audio: every 10 s, only when the sound ran dry or nearly.
@@ -222,11 +325,33 @@ void Watch(xe::Emulator* emulator, IDXGIAdapter3* adapter) {
       const uint64_t frames = sp::audio_frames.exchange(0), dry = sp::audio_dry.exchange(0),
                      one_left = sp::audio_one_left.exchange(0);
       const uint32_t fewest = sp::audio_min_queued.exchange(UINT32_MAX);
+      g_audio_dry.fetch_add(dry);
+      g_audio_one_left.fetch_add(one_left);
       if (dry || one_left) {
         XELOGW(
             "Spartan audio: in 10 s {} frames to XAudio2; the sound ran dry {} times (a gap), down to one frame {} "
             "times; fewest queued {} of {}",
             frames, dry, one_left, fewest == UINT32_MAX ? 0 : fewest, sp::audio_queue_size.load());
+      }
+      // Game files: only a window with a read or write of 100 ms or more.
+      const sp::IoStats io = sp::IoTakeWindow();
+      if (io.slow_reads || io.slow_writes) {
+        std::string text = fmt::format("Spartan files: in 10 s {} reads ({:.1f} MB, {} ms)", io.reads,
+                                       io.read_bytes / 1048576.0, io.read_us / 1000);
+        if (io.slow_reads) {
+          text += fmt::format(", {} took 100 ms or more, the slowest {} ms: '{}' ({} KB, {})", io.slow_reads,
+                              io.slowest_read_us / 1000, io.slowest_read_file, (io.slowest_read_bytes + 1023) / 1024,
+                              io.slowest_read_medium);
+        }
+        text += fmt::format("; {} writes", io.writes);
+        if (io.slow_writes) {
+          text += fmt::format(", {} took 100 ms or more, the slowest {} ms: '{}'", io.slow_writes,
+                              io.slowest_write_us / 1000, io.slowest_write_file);
+        }
+        if (io.drive_wait_us) {
+          text += fmt::format("; emulated drive speed waits {} ms", io.drive_wait_us / 1000);
+        }
+        XELOGW("{}", text);
       }
     }
 
@@ -245,6 +370,10 @@ void Watch(xe::Emulator* emulator, IDXGIAdapter3* adapter) {
     }
     app_peak = std::max(app_peak, app);
     gpu_peak = std::max(gpu_peak, gpu);
+    g_app_peak.store(app_peak);
+    g_gpu_peak.store(gpu_peak);
+    if (limit) g_app_limit.store(limit);
+    if (budget) g_gpu_budget.store(budget);
     if (limit) {
       app_levels.Check(100.0 * double(app) / double(limit), [&](int level) {
         XELOGW("Spartan memory: the app passed {}% of its memory limit: {} MB of {} MB (the Xbox closes it at the "
@@ -264,19 +393,23 @@ void Watch(xe::Emulator* emulator, IDXGIAdapter3* adapter) {
       XELOGI("Spartan memory: app {} MB of {} MB (peak {} MB), Xbox GPU memory {} MB of a {} MB budget (peak {} MB)",
              app >> 20, limit >> 20, app_peak >> 20, gpu >> 20, budget >> 20, gpu_peak >> 20);
     }
+    if (now - last_report >= minutes(5) && emulator->is_title_open()) {
+      last_report = now;
+      WriteReport("every 5 minutes");
+    }
   }
 }
 
 }  // namespace
 
 void StartTrackers(xe::Emulator* emulator) {
-  static std::atomic<bool> started{false};
-  if (!emulator || started.exchange(true)) {
+  if (!emulator || g_started.exchange(true)) {
     return;
   }
   XELOGI(
-      "Spartan trackers: on (short stalls from 80 ms, freezes from 1 s, audio gaps, memory levels, crashes) - the "
-      "RPCS3 Spartan Test trackers by PSYCHOsmurf; source {} {}; thread pc = {}",
+      "Spartan trackers: on (short stalls from 80 ms, freezes from 1 s with their cause, shader builds, game file "
+      "reads and writes, audio gaps, memory levels, crashes, a report card every 5 minutes) - the Spartan Test "
+      "trackers by PSYCHOsmurf; source {} {}; thread pc = {}",
       XE_BUILD_BRANCH, XE_BUILD_COMMIT_SHORT,
       cvars::log_safepoint_pc ? "the last loop it passed (log_safepoint_pc on)"
                               : "where it was last preempted (log_safepoint_pc off)");
@@ -286,6 +419,12 @@ void StartTrackers(xe::Emulator* emulator) {
     XELOGW("Spartan trackers: the GPU memory budget can't be read (no DXGI adapter), app memory only");
   }
   std::thread(Watch, emulator, adapter).detach();
+}
+
+void FinalReport() {
+  if (g_started.load()) {
+    WriteReport("Xenia closing");
+  }
 }
 
 }  // namespace spartan
