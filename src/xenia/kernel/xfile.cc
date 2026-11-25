@@ -31,14 +31,14 @@ namespace {
 uint32_t SpartanIoBegin(XFile* file, bool write, uint64_t byte_offset, uint32_t length, uint64_t start_us) {
   // IsInThread(nullptr): no guest thread here (an I/O worker finishing an async request)
   XThread* thread = XThread::IsInThread(nullptr) ? nullptr : XThread::GetCurrentThread();
-  return xe::spartan::IoBegin(thread ? thread->thread_id() : 0, write, file->path(),
-                              file->device()->spartan_medium(),
+  return xe::spartan::IoBegin(thread ? thread->thread_id() : 0, write, file->spartan_path(),
+                              file->spartan_medium(),
                               byte_offset == uint64_t(-1) ? file->position() : byte_offset, length, start_us);
 }
 
 void SpartanIoEnd(XFile* file, uint32_t ticket, bool write, X_STATUS result, const uint32_t* out_bytes,
                   uint64_t start_us, uint64_t io_done_us) {
-  xe::spartan::IoEnd(ticket, write, file->path(), file->device()->spartan_medium(),
+  xe::spartan::IoEnd(ticket, write, file->spartan_path(), file->spartan_medium(),
                      XSUCCEEDED(result) && out_bytes ? *out_bytes : 0, start_us, io_done_us,
                      xe::spartan::NowUs());
 }
@@ -54,6 +54,16 @@ XFile::XFile(KernelState* kernel_state, vfs::File* file, bool synchronous,
       is_buffered_(buffered) {
   async_event_ = threading::Event::CreateManualResetEvent(false);
   assert_not_null(async_event_);
+  SpartanRemember();
+}
+
+void XFile::SpartanRemember() {
+  if (file_ && file_->entry()) {
+    spartan_path_ = file_->entry()->path();
+    if (file_->entry()->device()) {
+      spartan_medium_ = file_->entry()->device()->spartan_medium();
+    }
+  }
 }
 
 XFile::XFile() : XObject(kObjectType), completion_port_lock_() {
@@ -624,6 +634,7 @@ object_ref<XFile> XFile::Restore(KernelState* kernel_state,
   }
 
   file->file_ = vfs_file;
+  file->SpartanRemember();
   file->position_ = position;
   file->is_synchronous_ = is_synchronous;
   file->is_buffered_ = is_buffered;
